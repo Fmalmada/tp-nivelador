@@ -2,20 +2,18 @@ package client
 
 import (
 	"bufio"
+	"errors"
 	"net"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/7574-sistemas-distribuidos/tp-nivelador/src/logger"
-	"github.com/7574-sistemas-distribuidos/tp-nivelador/src/safe_socket"
+	"github.com/7574-sistemas-distribuidos/tp-nivelador/src/protocol"
 )
 
 const CONNECTION_ATTEMPTS_MAX = 15
 const CONNECTION_ATTEMPS_DELAY_MS = 500
-
-const ECHO_CLIENT_BUFFER_SIZE = 512
-const ECHO_CLIENT_MESSAGE_AMOUNT = 3
-const ECHO_CLIENT_MESSAGE_DELAY_MS = 1000
 
 type ClientConfig struct {
 	ServerHost string
@@ -63,17 +61,63 @@ func connectToServer(host, port string) (net.Conn, error) {
 }
 
 func (client *Client) Run() error {
-	const mainAction = "process-input-file"
+	const mainAction = "run-agency"
 	defer client.conn.Close()
 
 	logger.Info(mainAction, logger.InProgress, "agency-id", client.config.AgencyId)
 
-	inputFile, err := os.Open(client.config.InputFile)
+	agencyId, err := strconv.Atoi(client.config.AgencyId)
+	if err != nil {
+		return err
+	}
+	if err := protocol.SendMessage(client.conn, protocol.Hello, []byte(strconv.Itoa(agencyId))); err != nil {
+		return err
+	}
 
+	inputFile, err := os.Open(client.config.InputFile)
 	if err != nil {
 		return err
 	}
 	defer inputFile.Close()
+
+	scanner := bufio.NewScanner(inputFile)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+
+		payload := protocol.EncodeBet([]string{line})
+		if err := protocol.SendMessage(client.conn, protocol.BetBatch, payload); err != nil {
+			return err
+		}
+
+		messageType, ackPayload, err := protocol.RecvMessage(client.conn)
+		if err != nil {
+			return err
+		}
+		if messageType != protocol.Ack {
+			return errors.New("expected ACK from server")
+		}
+		if _, err := protocol.DecodeAck(ackPayload); err != nil {
+			return err
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	if err := protocol.SendMessage(client.conn, protocol.Done, nil); err != nil {
+		return err
+	}
+
+	messageType, payload, err := protocol.RecvMessage(client.conn)
+	if err != nil {
+		return err
+	}
+	if messageType != protocol.Winners {
+		return errors.New("expected WINNERS from server")
+	}
 
 	outputFile, err := os.Create(client.config.OutputFile)
 	if err != nil {
@@ -81,33 +125,14 @@ func (client *Client) Run() error {
 	}
 	defer outputFile.Close()
 
-	scanner := bufio.NewScanner(inputFile)
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		if line == "" {
-			continue
-		}
-
-		if err := safe_socket.SendAll(client.conn, []byte(line)); err != nil {
+	writer := bufio.NewWriter(outputFile)
+	defer writer.Flush()
+	for _, winner := range protocol.DecodeWinners(payload) {
+		if _, err := writer.WriteString(winner + "\n"); err != nil {
 			return err
 		}
-		response, err := safe_socket.RecvAll(client.conn, len(line))
-
-		if err != nil {
-			return err
-		}
-
-		if _, err := outputFile.WriteString(string(response) + "\n"); err != nil {
-			return err
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return err
 	}
 
 	logger.Info(mainAction, logger.Success, "agency-id", client.config.AgencyId)
-
 	return nil
 }
