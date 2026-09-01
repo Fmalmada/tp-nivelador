@@ -54,7 +54,7 @@ func RecvMessage(reader io.Reader) (MessageType, []byte, error) {
 	return MessageType(body[0]), body[1:], nil
 }
 
-func EncodeBet(records []string) []byte {
+func EncodeBetBatch(records []string) []byte {
 	return []byte(strings.Join(records, _recordSep))
 }
 

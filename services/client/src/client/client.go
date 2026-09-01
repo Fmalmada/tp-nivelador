@@ -21,6 +21,7 @@ type ClientConfig struct {
 	AgencyId   string
 	InputFile  string
 	OutputFile string
+	BatchSize  int
 }
 
 type Client struct {
@@ -60,6 +61,30 @@ func connectToServer(host, port string) (net.Conn, error) {
 	return conn, err
 }
 
+func (client *Client) sendBatch(records []string) error {
+	payload := protocol.EncodeBetBatch(records)
+	if err := protocol.SendMessage(client.conn, protocol.BetBatch, payload); err != nil {
+		return err
+	}
+
+	messageType, ackPayload, err := protocol.RecvMessage(client.conn)
+	if err != nil {
+		return err
+	}
+	if messageType != protocol.Ack {
+		return errors.New("expected ACK from server")
+	}
+
+	stored, err := protocol.DecodeAck(ackPayload)
+	if err != nil {
+		return err
+	}
+	if stored != len(records) {
+		return errors.New("server stored fewer bets than sent")
+	}
+	return nil
+}
+
 func (client *Client) Run() error {
 	const mainAction = "run-agency"
 	defer client.conn.Close()
@@ -80,6 +105,7 @@ func (client *Client) Run() error {
 	}
 	defer inputFile.Close()
 
+	batch := make([]string, 0, client.config.BatchSize)
 	scanner := bufio.NewScanner(inputFile)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -87,24 +113,21 @@ func (client *Client) Run() error {
 			continue
 		}
 
-		payload := protocol.EncodeBet([]string{line})
-		if err := protocol.SendMessage(client.conn, protocol.BetBatch, payload); err != nil {
-			return err
-		}
-
-		messageType, ackPayload, err := protocol.RecvMessage(client.conn)
-		if err != nil {
-			return err
-		}
-		if messageType != protocol.Ack {
-			return errors.New("expected ACK from server")
-		}
-		if _, err := protocol.DecodeAck(ackPayload); err != nil {
-			return err
+		batch = append(batch, line)
+		if len(batch) == client.config.BatchSize {
+			if err := client.sendBatch(batch); err != nil {
+				return err
+			}
+			batch = batch[:0]
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return err
+	}
+	if len(batch) > 0 {
+		if err := client.sendBatch(batch); err != nil {
+			return err
+		}
 	}
 
 	if err := protocol.SendMessage(client.conn, protocol.Done, nil); err != nil {
