@@ -1,17 +1,23 @@
 import socket
+import threading
 
 import logger
 import protocol
 from lottery import Bet, Lottery
+from server.drawcoordinator import _DrawCoordinator
 
 _STORAGE_PATH = "/tmp/bets.csv"
 
 
 class Server:
-    def __init__(self, server_host: str, server_port: int) -> None:
+    def __init__(
+        self, server_host: str, server_port: int, agency_quorum_min: int
+    ) -> None:
         self.server_host = server_host
         self.server_port = server_port
         self._lottery = Lottery(storage_path=_STORAGE_PATH)
+        self._storage_lock = threading.Lock()
+        self._coordinator = _DrawCoordinator(agency_quorum_min)
         open(_STORAGE_PATH, "a").close()
 
     @staticmethod
@@ -23,11 +29,13 @@ class Server:
 
     def _store_batch(self, agency_id: int, records: list[list[str]]) -> int:
         bets = [self._bet_from_fields(agency_id, fields) for fields in records]
-        self._lottery.store_bets(bets)
+        with self._storage_lock:
+            self._lottery.store_bets(bets)
         return len(bets)
 
     def _compute_own_winners(self, agency_id: int) -> list[list[str]]:
-        bets = list(self._lottery.load_bets())
+        with self._storage_lock:
+            bets = list(self._lottery.load_bets())
         winners = []
         for bet in bets:
             if bet.agency_id != agency_id or not self._lottery.has_won(bet):
@@ -69,6 +77,8 @@ class Server:
                 else:
                     raise ValueError(f"unexpected message type {message_type!r}")
 
+            self._coordinator.notify_finished_and_wait()
+
             winners = self._compute_own_winners(agency_id)
             protocol.send_message(
                 client_socket, protocol.WINNERS, protocol.encode_winners(winners)
@@ -105,4 +115,5 @@ class Server:
                     raise e
                 logger.info(action, logger.LogResult.success)
 
-                self._handle_client(client_socket)
+                thread = threading.Thread(target=self._handle_client, args=(client_socket,))
+                thread.start()
