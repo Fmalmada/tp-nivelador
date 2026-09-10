@@ -1,7 +1,7 @@
 import threading
 
 
-class _DrawCoordinator:
+class DrawCoordinator:
     def __init__(self, quorum: int) -> None:
         self._quorum = max(quorum, 1)
         self._finished = 0
@@ -17,3 +17,8 @@ class _DrawCoordinator:
                 return
             while not self._released:
                 self._condition.wait()
+
+    def release_all(self) -> None:
+        with self._condition:
+            self._released = True
+            self._condition.notify_all()

@@ -5,7 +5,10 @@ import (
 	"errors"
 	"net"
 	"os"
+	"os/signal"
 	"strconv"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/7574-sistemas-distribuidos/tp-nivelador/src/logger"
@@ -25,8 +28,9 @@ type ClientConfig struct {
 }
 
 type Client struct {
-	conn   net.Conn
-	config ClientConfig
+	conn         net.Conn
+	config       ClientConfig
+	shuttingDown atomic.Bool
 }
 
 func NewClient(config ClientConfig) (*Client, error) {
@@ -61,6 +65,26 @@ func connectToServer(host, port string) (net.Conn, error) {
 	return conn, err
 }
 
+func (client *Client) watchSigterm() {
+	signalChannel := make(chan os.Signal, 1)
+	signal.Notify(signalChannel, syscall.SIGTERM)
+	go func() {
+		<-signalChannel
+		logger.Info("sigterm", logger.InProgress)
+		client.shuttingDown.Store(true)
+		client.conn.Close()
+	}()
+}
+
+func (client *Client) handleRunError(action string, err error) error {
+	if client.shuttingDown.Load() {
+		logger.Info(action, logger.Success, "reason", "sigterm")
+		return nil
+	}
+	logger.Error(action, logger.Fail, "err", err)
+	return err
+}
+
 func (client *Client) sendBatch(records []string) error {
 	payload := protocol.EncodeBetBatch(records)
 	if err := protocol.SendMessage(client.conn, protocol.BetBatch, payload); err != nil {
@@ -88,6 +112,7 @@ func (client *Client) sendBatch(records []string) error {
 func (client *Client) Run() error {
 	const mainAction = "run-agency"
 	defer client.conn.Close()
+	client.watchSigterm()
 
 	logger.Info(mainAction, logger.InProgress, "agency-id", client.config.AgencyId)
 
@@ -96,7 +121,7 @@ func (client *Client) Run() error {
 		return err
 	}
 	if err := protocol.SendMessage(client.conn, protocol.Hello, []byte(strconv.Itoa(agencyId))); err != nil {
-		return err
+		return client.handleRunError("send-hello", err)
 	}
 
 	inputFile, err := os.Open(client.config.InputFile)
@@ -116,7 +141,7 @@ func (client *Client) Run() error {
 		batch = append(batch, line)
 		if len(batch) == client.config.BatchSize {
 			if err := client.sendBatch(batch); err != nil {
-				return err
+				return client.handleRunError("send-batch", err)
 			}
 			batch = batch[:0]
 		}
@@ -126,17 +151,17 @@ func (client *Client) Run() error {
 	}
 	if len(batch) > 0 {
 		if err := client.sendBatch(batch); err != nil {
-			return err
+			return client.handleRunError("send-batch", err)
 		}
 	}
 
 	if err := protocol.SendMessage(client.conn, protocol.Done, nil); err != nil {
-		return err
+		return client.handleRunError("send-done", err)
 	}
 
 	messageType, payload, err := protocol.RecvMessage(client.conn)
 	if err != nil {
-		return err
+		return client.handleRunError("receive-winners", err)
 	}
 	if messageType != protocol.Winners {
 		return errors.New("expected WINNERS from server")

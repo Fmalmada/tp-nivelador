@@ -1,4 +1,5 @@
 import os
+import signal
 import sys
 
 import logger
@@ -12,6 +13,12 @@ AGENCY_QUORUM_MIN = int(os.environ.get("AGENCY_QUORUM_MIN", "1"))
 def main():
     logger.init()
     s = server.Server(SERVER_HOST, SERVER_PORT, AGENCY_QUORUM_MIN)
+
+    def handle_sigterm(_signum, _frame):
+        s.shutdown()
+
+    signal.signal(signal.SIGTERM, handle_sigterm)
+
     try:
         s.run()
     except Exception as e:
