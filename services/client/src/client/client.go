@@ -17,6 +17,7 @@ import (
 
 const CONNECTION_ATTEMPTS_MAX = 15
 const CONNECTION_ATTEMPS_DELAY_MS = 500
+const GC_RELEASE_INTERVAL_BATCHES = 50
 
 type ClientConfig struct {
 	ServerHost string
@@ -39,9 +40,7 @@ func NewClient(config ClientConfig) (*Client, error) {
 		logger.Warn("connect-to-server", logger.Fail)
 		return nil, err
 	}
-
-	client := &Client{conn: conn, config: config}
-	return client, nil
+	return &Client{conn: conn, config: config}, nil
 }
 
 func connectToServer(host, port string) (net.Conn, error) {
@@ -57,11 +56,9 @@ func connectToServer(host, port string) (net.Conn, error) {
 			time.Sleep(CONNECTION_ATTEMPS_DELAY_MS * time.Millisecond)
 			continue
 		}
-
 		logger.Info(action, logger.Success)
 		break
 	}
-
 	return conn, err
 }
 
@@ -83,6 +80,18 @@ func (client *Client) handleRunError(action string, err error) error {
 	}
 	logger.Error(action, logger.Fail, "err", err)
 	return err
+}
+
+func (client *Client) sendHello() error {
+	agencyId, err := strconv.Atoi(client.config.AgencyId)
+	if err != nil {
+		return err
+	}
+	payload := []byte(strconv.Itoa(agencyId))
+	if err := protocol.SendMessage(client.conn, protocol.Hello, payload); err != nil {
+		return client.handleRunError("send-hello", err)
+	}
+	return nil
 }
 
 func (client *Client) sendBatch(records []string) error {
@@ -109,65 +118,51 @@ func (client *Client) sendBatch(records []string) error {
 	return nil
 }
 
-func (client *Client) Run() error {
-	const mainAction = "run-agency"
-	defer client.conn.Close()
-	client.watchSigterm()
+func (client *Client) sendDone() error {
+	if err := protocol.SendMessage(client.conn, protocol.Done, nil); err != nil {
+		return client.handleRunError("send-done", err)
+	}
+	return nil
+}
 
-	logger.Info(mainAction, logger.InProgress, "agency-id", client.config.AgencyId)
-
-	agencyId, err := strconv.Atoi(client.config.AgencyId)
+func (client *Client) receiveWinners() ([]string, error) {
+	messageType, payload, err := protocol.RecvMessage(client.conn)
 	if err != nil {
-		return err
+		return nil, client.handleRunError("receive-winners", err)
 	}
-	if err := protocol.SendMessage(client.conn, protocol.Hello, []byte(strconv.Itoa(agencyId))); err != nil {
-		return client.handleRunError("send-hello", err)
+	if messageType != protocol.Winners {
+		return nil, errors.New("expected WINNERS from server")
 	}
+	return protocol.DecodeWinners(payload), nil
+}
 
+func (client *Client) sendBetsFromInputFile() error {
 	inputFile, err := os.Open(client.config.InputFile)
 	if err != nil {
 		return err
 	}
 	defer inputFile.Close()
 
-	batch := make([]string, 0, client.config.BatchSize)
+	sender := newBatchSender(client, client.config.BatchSize)
+
 	scanner := bufio.NewScanner(inputFile)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
 			continue
 		}
-
-		batch = append(batch, line)
-		if len(batch) == client.config.BatchSize {
-			if err := client.sendBatch(batch); err != nil {
-				return client.handleRunError("send-batch", err)
-			}
-			batch = batch[:0]
+		if err := sender.add(line); err != nil {
+			return err
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return err
 	}
-	if len(batch) > 0 {
-		if err := client.sendBatch(batch); err != nil {
-			return client.handleRunError("send-batch", err)
-		}
-	}
+	return sender.flush()
+}
 
-	if err := protocol.SendMessage(client.conn, protocol.Done, nil); err != nil {
-		return client.handleRunError("send-done", err)
-	}
-
-	messageType, payload, err := protocol.RecvMessage(client.conn)
-	if err != nil {
-		return client.handleRunError("receive-winners", err)
-	}
-	if messageType != protocol.Winners {
-		return errors.New("expected WINNERS from server")
-	}
-
-	outputFile, err := os.Create(client.config.OutputFile)
+func writeWinnersToOutputFile(outputPath string, winners []string) error {
+	outputFile, err := os.Create(outputPath)
 	if err != nil {
 		return err
 	}
@@ -175,10 +170,38 @@ func (client *Client) Run() error {
 
 	writer := bufio.NewWriter(outputFile)
 	defer writer.Flush()
-	for _, winner := range protocol.DecodeWinners(payload) {
+
+	for _, winner := range winners {
 		if _, err := writer.WriteString(winner + "\n"); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (client *Client) Run() error {
+	const mainAction = "run-agency"
+	defer client.conn.Close()
+	client.watchSigterm()
+
+	logger.Info(mainAction, logger.InProgress, "agency-id", client.config.AgencyId)
+
+	if err := client.sendHello(); err != nil {
+		return err
+	}
+	if err := client.sendBetsFromInputFile(); err != nil {
+		return err
+	}
+	if err := client.sendDone(); err != nil {
+		return err
+	}
+
+	winners, err := client.receiveWinners()
+	if err != nil {
+		return err
+	}
+	if err := writeWinnersToOutputFile(client.config.OutputFile, winners); err != nil {
+		return err
 	}
 
 	logger.Info(mainAction, logger.Success, "agency-id", client.config.AgencyId)
